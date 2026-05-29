@@ -1,0 +1,276 @@
+import time
+import math
+import threading
+import socket
+
+from dynamixel_sdk import *
+
+# ============================================================
+# DYNAMIXEL SETTINGS
+# ============================================================
+
+DEVICENAME = 'COM5'
+BAUDRATE = 57600
+DXL_ID = 1
+
+PROTOCOL_VERSION = 2.0
+
+ADDR_TORQUE_ENABLE = 64
+ADDR_OPERATING_MODE = 11
+ADDR_GOAL_POSITION = 116
+
+TORQUE_ENABLE = 1
+TORQUE_DISABLE = 0
+
+DXL_MIN_POS = 0
+DXL_MAX_POS = 4095
+
+# ============================================================
+# SWIMMING PARAMETERS
+# ============================================================
+
+MIN_ANGLE = 0
+MAX_ANGLE = 180
+
+centerAngle = 90.0
+amplitudeDeg = 10.0
+frequencyHz = 1.5
+
+UPDATES_PER_CYCLE = 100
+
+# ============================================================
+# STATE FLAGS
+# ============================================================
+
+swimming = False
+stop_requested = False
+
+# ============================================================
+# TIMING
+# ============================================================
+
+def compute_update_interval():
+    return 1.0 / (frequencyHz * UPDATES_PER_CYCLE)
+
+# ============================================================
+# ANGLE CONVERSION
+# ============================================================
+
+def angle_to_dxl(angleDeg):
+
+    normalized = (angleDeg - MIN_ANGLE) / (MAX_ANGLE - MIN_ANGLE)
+
+    return int(
+        normalized * (DXL_MAX_POS - DXL_MIN_POS)
+        + DXL_MIN_POS
+    )
+
+# ============================================================
+# DYNAMIXEL SETUP
+# ============================================================
+
+portHandler = PortHandler(DEVICENAME)
+packetHandler = PacketHandler(PROTOCOL_VERSION)
+
+portHandler.openPort()
+portHandler.setBaudRate(BAUDRATE)
+
+# Disable torque
+packetHandler.write1ByteTxRx(
+    portHandler,
+    DXL_ID,
+    ADDR_TORQUE_ENABLE,
+    TORQUE_DISABLE
+)
+
+# Position mode
+packetHandler.write1ByteTxRx(
+    portHandler,
+    DXL_ID,
+    ADDR_OPERATING_MODE,
+    3
+)
+
+# Enable torque
+packetHandler.write1ByteTxRx(
+    portHandler,
+    DXL_ID,
+    ADDR_TORQUE_ENABLE,
+    TORQUE_ENABLE
+)
+
+# Move to center
+center_pos = angle_to_dxl(centerAngle)
+
+packetHandler.write4ByteTxOnly(
+    portHandler,
+    DXL_ID,
+    ADDR_GOAL_POSITION,
+    center_pos
+)
+
+print("Dynamixel ready")
+
+# ============================================================
+# SWIMMING LOOP
+# ============================================================
+
+def swim_loop():
+
+    global swimming
+    global stop_requested
+
+    dt = compute_update_interval()
+
+    t0 = time.perf_counter()
+    next_time = t0
+
+    while swimming:
+
+        now = time.perf_counter()
+
+        if now < next_time:
+            time.sleep(next_time - now)
+
+        t = now - t0
+
+        angle = centerAngle + amplitudeDeg * math.sin(
+            2.0 * math.pi * frequencyHz * t
+        )
+
+        angle = max(MIN_ANGLE, min(MAX_ANGLE, angle))
+
+        dxl_pos = angle_to_dxl(angle)
+
+        packetHandler.write4ByteTxOnly(
+            portHandler,
+            DXL_ID,
+            ADDR_GOAL_POSITION,
+            dxl_pos
+        )
+
+        # ----------------------------------------------------
+        # graceful stop
+        # ----------------------------------------------------
+
+        if stop_requested:
+
+            phase = (t * frequencyHz) % 1.0
+
+            # near cycle completion
+            if phase < 0.02:
+                break
+
+        next_time += dt
+
+    # Return to center
+    center_pos = angle_to_dxl(centerAngle)
+
+    packetHandler.write4ByteTxOnly(
+        portHandler,
+        DXL_ID,
+        ADDR_GOAL_POSITION,
+        center_pos
+    )
+
+    swimming = False
+    stop_requested = False
+
+    print("done")
+
+    conn.sendall(b"done\n")
+
+# ============================================================
+# SOCKET SERVER
+# ============================================================
+
+HOST = '127.0.0.1'
+PORT = 5000
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+server.bind((HOST, PORT))
+server.listen(1)
+
+print("Waiting for MATLAB connection...")
+
+conn, addr = server.accept()
+
+print("MATLAB connected")
+
+# ============================================================
+# COMMAND LOOP
+# ============================================================
+
+while True:
+
+    cmd = conn.recv(1024).decode().strip()
+
+    print("Received:", cmd)
+
+    # --------------------------------------------------------
+    # GO
+    # --------------------------------------------------------
+
+    if cmd == "go":
+
+        if not swimming:
+
+            swimming = True
+            stop_requested = False
+
+            thread = threading.Thread(target=swim_loop)
+            thread.start()
+
+    # --------------------------------------------------------
+    # STOP
+    # --------------------------------------------------------
+
+    elif cmd == "stop":
+
+        if swimming:
+            stop_requested = True
+
+    # --------------------------------------------------------
+    # PARAMETER UPDATE
+    # --------------------------------------------------------
+
+    elif cmd.startswith("freq"):
+
+        frequencyHz = float(cmd.split()[1])
+
+        print("Frequency set to", frequencyHz)
+
+    elif cmd.startswith("amp"):
+
+        amplitudeDeg = float(cmd.split()[1])
+
+        print("Amplitude set to", amplitudeDeg)
+
+    elif cmd.startswith("center"):
+
+        centerAngle = float(cmd.split()[1])
+
+        print("Center set to", centerAngle)
+
+    # --------------------------------------------------------
+    # EXIT
+    # --------------------------------------------------------
+
+    elif cmd == "exit":
+        break
+
+# ============================================================
+# SHUTDOWN
+# ============================================================
+
+packetHandler.write1ByteTxRx(
+    portHandler,
+    DXL_ID,
+    ADDR_TORQUE_ENABLE,
+    TORQUE_DISABLE
+)
+
+portHandler.closePort()
+
+print("Shutdown complete")

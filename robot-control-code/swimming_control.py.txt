@@ -1,0 +1,104 @@
+import time
+import math
+from dynamixel_sdk import *
+
+# ===== Dynamixel setup =====
+DEVICENAME = 'COM5'   # change this
+BAUDRATE = 57600
+DXL_ID = 1
+
+PROTOCOL_VERSION = 2.0
+
+ADDR_TORQUE_ENABLE = 64
+ADDR_OPERATING_MODE = 11
+ADDR_GOAL_POSITION = 116
+
+TORQUE_ENABLE = 1
+TORQUE_DISABLE = 0
+
+DXL_MIN_POS = 0
+DXL_MAX_POS = 4095
+
+# ---- USER SETTINGS (same as INO) ----
+MIN_ANGLE = 0
+MAX_ANGLE = 180
+
+centerAngle   = 87.0
+amplitudeDeg  = 15
+frequencyHz   = 0.6
+
+UPDATES_PER_CYCLE = 100
+numTailBeats = 15
+
+# ---- Timing ----
+def compute_update_interval():
+    return 1.0 / (frequencyHz * UPDATES_PER_CYCLE)
+
+# ---- Angle mapping ----
+def angle_to_dxl(angleDeg):
+    normalized = (angleDeg - MIN_ANGLE) / (MAX_ANGLE - MIN_ANGLE)
+    return int(normalized * (DXL_MAX_POS - DXL_MIN_POS) + DXL_MIN_POS)
+
+# ---- Setup Dynamixel ----
+portHandler = PortHandler(DEVICENAME)
+packetHandler = PacketHandler(PROTOCOL_VERSION)
+
+portHandler.openPort()
+portHandler.setBaudRate(BAUDRATE)
+
+# Disable torque → set mode → enable torque
+packetHandler.write1ByteTxRx(portHandler, DXL_ID, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+packetHandler.write1ByteTxRx(portHandler, DXL_ID, ADDR_OPERATING_MODE, 3)  # position mode
+packetHandler.write1ByteTxRx(portHandler, DXL_ID, ADDR_TORQUE_ENABLE, TORQUE_ENABLE)
+
+center_pos = angle_to_dxl(centerAngle)
+packetHandler.write4ByteTxRx(
+            portHandler, DXL_ID, ADDR_GOAL_POSITION, center_pos
+        )
+
+print("=== Dynamixel Tail Controller ===")
+print("Type 'go' to start")
+
+# ---- Main loop (like Arduino loop) ----
+while True:
+    cmd = input().strip()
+
+    if cmd == "go":
+        print("Starting experiment")
+
+        duration = numTailBeats / frequencyHz
+        dt = compute_update_interval()
+
+        t0 = time.time()
+
+        while True:
+            t = time.time() - t0
+
+            if t >= duration:
+                break
+
+            angle = centerAngle + amplitudeDeg * math.sin(2.0 * math.pi * frequencyHz * t)
+            angle = max(MIN_ANGLE, min(MAX_ANGLE, angle))
+
+            dxl_pos = angle_to_dxl(angle)
+
+            packetHandler.write4ByteTxOnly(
+                portHandler, DXL_ID, ADDR_GOAL_POSITION, dxl_pos
+            )
+
+            time.sleep(dt)
+
+        # Return to center
+        center_pos = angle_to_dxl(centerAngle)
+        packetHandler.write4ByteTxRx(
+            portHandler, DXL_ID, ADDR_GOAL_POSITION, center_pos
+        )
+
+        print("done")
+
+    elif cmd == "exit":
+        break
+
+# ---- Shutdown ----
+packetHandler.write1ByteTxRx(portHandler, DXL_ID, ADDR_TORQUE_ENABLE, TORQUE_DISABLE)
+portHandler.closePort()
